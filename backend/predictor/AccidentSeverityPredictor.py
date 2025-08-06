@@ -5,6 +5,8 @@ from pyspark.sql.types import DoubleType, StructType, StructField, StringType, B
 from kafka import KafkaProducer, KafkaConsumer
 import json
 import time
+import random
+from datetime import datetime, timedelta
 
 class AccidentSeverityPredictor:
     def __init__(self, model_path="models/us_accidents_severity_rf", kafka_topic="output_topic", top_n=128):
@@ -29,11 +31,9 @@ class AccidentSeverityPredictor:
         return df
 
     def _prepare_data(self, df):
-        df = df \
-            .withColumn("Start_TS", to_timestamp(col("Start_Time"), "yyyy-MM-dd HH:mm:ss")) \
-            .withColumn("End_TS", to_timestamp(col("End_Time"), "yyyy-MM-dd HH:mm:ss")) \
-            .withColumn("Duration", ((unix_timestamp(col("End_TS")) - unix_timestamp(col("Start_TS"))) / 60).cast(DoubleType())) \
-            .drop("Start_TS", "End_TS", "Start_Time", "End_Time")
+        # Zaman sütunlarını işle
+        df = df.withColumn("Duration", 
+            ((unix_timestamp(col("End_Time")) - unix_timestamp(col("Start_Time"))) / 60).cast(DoubleType()))
 
         df = self._clean_column(df, "City")
         df = self._clean_column(df, "Street")
@@ -59,53 +59,81 @@ class AccidentSeverityPredictor:
                 print(f"Error in run_service: {str(e)}")
                 time.sleep(5)  # Wait a bit before retrying
 
+    def _generate_random_accident(self):
+        """Gerçekçi rastgele kaza verisi üret"""
+        # Büyük şehirler ve koordinatları
+        cities = {
+            "New York": {"lat": (40.7128, 40.7818), "lng": (-74.0060, -73.9260), "state": "NY"},
+            "Los Angeles": {"lat": (34.0522, 34.1522), "lng": (-118.2437, -118.1637), "state": "CA"},
+            "Chicago": {"lat": (41.8781, 41.9281), "lng": (-87.6298, -87.5498), "state": "IL"},
+            "Houston": {"lat": (29.7604, 29.8104), "lng": (-95.3698, -95.2898), "state": "TX"},
+            "Phoenix": {"lat": (33.4484, 33.4984), "lng": (-112.0740, -111.9940), "state": "AZ"},
+            "Philadelphia": {"lat": (39.9526, 40.0026), "lng": (-75.1652, -75.0852), "state": "PA"},
+            "San Antonio": {"lat": (29.4241, 29.4741), "lng": (-98.4936, -98.4136), "state": "TX"},
+            "San Diego": {"lat": (32.7157, 32.7657), "lng": (-117.1611, -117.0811), "state": "CA"},
+            "Dallas": {"lat": (32.7767, 32.8267), "lng": (-96.7970, -96.7170), "state": "TX"},
+            "San Jose": {"lat": (37.3382, 37.3882), "lng": (-121.8863, -121.8063), "state": "CA"}
+        }
+
+        # Rastgele bir şehir seç
+        city_name = random.choice(list(cities.keys()))
+        city_data = cities[city_name]
+        
+        # Hava durumu seçenekleri ve olasılıkları
+        weather_conditions = {
+            "Clear": 0.3,
+            "Mostly Cloudy": 0.2,
+            "Overcast": 0.1,
+            "Light Rain": 0.1,
+            "Rain": 0.1,
+            "Heavy Rain": 0.05,
+            "Light Snow": 0.05,
+            "Snow": 0.03,
+            "Fog": 0.05,
+            "Light Drizzle": 0.02
+        }
+
+        # Zaman hesaplama
+        now = datetime.now()
+        random_minutes = random.randint(0, 60)  # Son 1 saat içinde
+        start_time = now - timedelta(minutes=random_minutes)
+        duration = random.randint(15, 120)  # 15 dk ile 2 saat arası
+        end_time = start_time + timedelta(minutes=duration)
+
+        # Ana cadde isimleri
+        streets = ["Main St", "Broadway", "1st Ave", "Park Ave", "Washington St", "Lake St", 
+                  "Market St", "Central Ave", "Madison Ave", "Highland Ave"]
+
+        return {
+            "Start_Time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "End_Time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "Temperature(F)": round(random.uniform(20.0, 100.0), 1),
+            "Humidity(%)": round(random.uniform(30.0, 100.0), 1),
+            "Pressure(in)": round(random.uniform(29.0, 31.0), 2),
+            "Visibility(mi)": round(random.uniform(0.5, 10.0), 1),
+            "Wind_Speed(mph)": round(random.uniform(0.0, 30.0), 1),
+            "Precipitation(in)": round(random.uniform(0.0, 2.0), 2),
+            "Weather_Condition": random.choices(list(weather_conditions.keys()), 
+                                             weights=list(weather_conditions.values()))[0],
+            "Wind_Direction": random.choice(["N", "NE", "E", "SE", "S", "SW", "W", "NW"]),
+            "Civil_Twilight": random.choice(["Day", "Night"]),
+            "Sunrise_Sunset": random.choice(["Day", "Night"]),
+            "State": city_data["state"],
+            "City": city_name,
+            "Street": random.choice(streets),
+            "Wind_Chill(F)": round(random.uniform(20.0, 95.0), 1),
+            "Junction": random.choice([True, False]),
+            "Crossing": random.choice([True, False]),
+            "Traffic_Signal": random.choice([True, False]),
+            "Start_Lat": round(random.uniform(city_data["lat"][0], city_data["lat"][1]), 6),
+            "Start_Lng": round(random.uniform(city_data["lng"][0], city_data["lng"][1]), 6)
+        }
+
     def run_example(self):
         print("Starting prediction process...")
-        # Minimal example input
-        example_rows = [
-            {
-                "Start_Time": "2022-09-01 08:00:00",
-                "End_Time": "2022-09-01 09:00:00",
-                "Temperature(F)": 70.0,
-                "Humidity(%)": 55.0,
-                "Pressure(in)": 29.5,
-                "Visibility(mi)": 10.0,
-                "Wind_Speed(mph)": 5.0,
-                "Precipitation(in)": 0.0,
-                "Weather_Condition": "Clear",
-                "Wind_Direction": "NW",
-                "Civil_Twilight": "Day",
-                "Sunrise_Sunset": "Day",
-                "State": "CA",
-                "City": "Los Angeles",
-                "Street": "Sunset Blvd",
-                "Wind_Chill(F)": 70.0,
-                "Junction": False,
-                "Crossing": True,
-                "Traffic_Signal": True
-            },
-            {
-                "Start_Time": "2022-09-01 10:00:00",
-                "End_Time": "2022-09-01 11:30:00",
-                "Temperature(F)": 60.0,
-                "Humidity(%)": 80.0,
-                "Pressure(in)": 30.0,
-                "Visibility(mi)": 8.0,
-                "Wind_Speed(mph)": 10.0,
-                "Precipitation(in)": 0.1,
-                "Weather_Condition": "Rain",
-                "Wind_Direction": "SE",
-                "Civil_Twilight": "Day",
-                "Sunrise_Sunset": "Day",
-                "State": "NY",
-                "City": "New York",
-                "Street": "Broadway",
-                "Wind_Chill(F)": 59.0,
-                "Junction": True,
-                "Crossing": False,
-                "Traffic_Signal": True
-            }
-        ]
+        # 3-7 arası rastgele kaza üret
+        num_accidents = random.randint(3, 7)
+        example_rows = [self._generate_random_accident() for _ in range(num_accidents)]
 
         print("Creating DataFrame...")
         df = self.spark.createDataFrame(example_rows)
@@ -115,19 +143,28 @@ class AccidentSeverityPredictor:
         predictions = self.model.transform(df_clean)
         print("Predictions made successfully.")
 
-        # Add sample coordinates for visualization
-        locations = [
-            {"lat": 40.7128, "lng": -74.0060},  # New York
-            {"lat": 34.0522, "lng": -118.2437}  # Los Angeles
-        ]
-
-        output_data = predictions.select("prediction").collect()
+        # Tahminleri al
+        predictions_data = predictions.select("prediction").collect()
+        # Orijinal verileri al
+        original_data = df.select(
+            "Start_Lat", "Start_Lng", "Temperature(F)", 
+            "Weather_Condition", "Start_Time"
+        ).collect()
         
-        for i, row in enumerate(output_data):
+        # İki veri setini birleştir
+        for pred, orig in zip(predictions_data, original_data):
             message = {
-                "prediction": float(row["prediction"]),
-                "location": locations[i % len(locations)],
-                "timestamp": time.time()
+                "prediction": float(pred["prediction"]),
+                "location": {
+                    "lat": float(orig["Start_Lat"]),
+                    "lng": float(orig["Start_Lng"])
+                },
+                "timestamp": time.time(),
+                "details": {
+                    "temperature": float(orig["Temperature(F)"]),
+                    "weather": str(orig["Weather_Condition"]),
+                    "time": str(orig["Start_Time"])
+                }
             }
             self.producer.send(self.kafka_topic, message)
             print("Sent to Kafka:", message)
