@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "@nestjs/core": "^11.1.5",
+    "@nestjs/platform-express": "^11.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.2.0"
+  }
+}

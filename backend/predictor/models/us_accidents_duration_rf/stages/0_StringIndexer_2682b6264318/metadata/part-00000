@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.feature.StringIndexerModel","timestamp":1753114515893,"sparkVersion":"3.5.1","uid":"StringIndexer_2682b6264318","paramMap":{"outputCol":"Wind_Direction_Idx","inputCol":"Wind_Direction","handleInvalid":"keep"},"defaultParamMap":{"outputCol":"StringIndexer_2682b6264318__output","handleInvalid":"error","stringOrderType":"frequencyDesc"}}
