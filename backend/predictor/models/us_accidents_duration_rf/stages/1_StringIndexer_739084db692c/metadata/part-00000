@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.feature.StringIndexerModel","timestamp":1754520600910,"sparkVersion":"3.5.1","uid":"StringIndexer_739084db692c","paramMap":{"outputCol":"Civil_Twilight_Idx","handleInvalid":"keep","inputCol":"Civil_Twilight"},"defaultParamMap":{"outputCol":"StringIndexer_739084db692c__output","handleInvalid":"error","stringOrderType":"frequencyDesc"}}

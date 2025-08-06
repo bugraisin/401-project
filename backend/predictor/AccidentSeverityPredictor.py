@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession
 from pyspark.ml import PipelineModel
-from pyspark.sql.functions import col, when, to_timestamp, unix_timestamp
+from pyspark.sql.functions import col, when, to_timestamp, unix_timestamp, hour, month, dayofweek, lit, bround
 from pyspark.sql.types import DoubleType, StructType, StructField, StringType, BooleanType, FloatType
 from kafka import KafkaProducer, KafkaConsumer
 import json
@@ -9,9 +9,12 @@ import random
 from datetime import datetime, timedelta
 
 class AccidentSeverityPredictor:
-    def __init__(self, model_path="models/us_accidents_severity_rf", kafka_topic="output_topic", top_n=128):
+    def __init__(self, severity_model_path="models/us_accidents_severity_rf", 
+                 duration_model_path="models/us_accidents_duration_rf", 
+                 kafka_topic="output_topic", top_n=128):
         self.spark = SparkSession.builder.appName("AccidentSeverityPredictor").getOrCreate()
-        self.model = PipelineModel.load(model_path)
+        self.severity_model = PipelineModel.load(severity_model_path)
+        self.duration_model = PipelineModel.load(duration_model_path)
         self.kafka_topic = kafka_topic
         self.top_n = top_n
 
@@ -31,18 +34,44 @@ class AccidentSeverityPredictor:
         return df
 
     def _prepare_data(self, df):
-        # Zaman sütunlarını işle
-        df = df.withColumn("Duration", 
-            ((unix_timestamp(col("End_Time")) - unix_timestamp(col("Start_Time"))) / 60).cast(DoubleType()))
+        """Veri hazırlama - hem severity hem duration tahmini için"""
+        # Timestamp kolonlarından ek özellikler oluştur
+        df = df.withColumn("Start_TS", to_timestamp(col("Start_Time"), "yyyy-MM-dd HH:mm:ss"))
+        df = df.withColumn("Hour", hour(col("Start_TS")))
+        df = df.withColumn("DayOfWeek", dayofweek(col("Start_TS")))
+        df = df.withColumn("Month", month(col("Start_TS")))
+        df = df.withColumn("Weather_Hour", hour(col("Start_TS")))  # Weather_Hour için Start_Time kullan
+        df = df.withColumn("Weather_Day", month(col("Start_TS")))  # Weather_Day için month kullan (model eğitimindeki gibi)
 
+        # Time slot kategorisi oluştur (0: gece, 1: sabah, 2: öğleden sonra, 3: akşam)
+        df = df.withColumn("TimeSlot", 
+            when((hour(col("Start_TS")) >= 0) & (hour(col("Start_TS")) < 6), 0)
+            .when((hour(col("Start_TS")) >= 6) & (hour(col("Start_TS")) < 12), 1)
+            .when((hour(col("Start_TS")) >= 12) & (hour(col("Start_TS")) < 18), 2)
+            .otherwise(3))
+
+        # Boolean kolonları ikili değerlere dönüştür (sadece modelde kullanılanlar)
+        df = df.withColumn("Junction_Bin", when(col("Junction") == True, 1).otherwise(0))
+        # Not: Crossing_Bin ve Traffic_Signal_Bin model eğitiminde kullanılmamış
+        
+        # Weather_Condition kolonunu temizle
+        df = self._clean_column(df, "Weather_Condition")
+        # City ve Street kolonlarını temizle
         df = self._clean_column(df, "City")
         df = self._clean_column(df, "Street")
 
+        # Start_Lat ve Start_Lng yuvarlama
+        df = df.withColumn("Start_Lat", bround(col("Start_Lat"), 1))
+        df = df.withColumn("Start_Lng", bround(col("Start_Lng"), 1))
+
+        # Modeller için gerekli kolonlar (model eğitimindeki feature_cols ile uyumlu)
         selected_cols = [
-            "Temperature(F)", "Humidity(%)", "Pressure(in)", "Visibility(mi)", "Duration",
-            "Wind_Speed(mph)", "Precipitation(in)", "Weather_Condition", "Wind_Direction",
+            "Temperature(F)", "Humidity(%)", "Pressure(in)", "Visibility(mi)",
+            "Wind_Speed(mph)", "Weather_Condition_Cleaned", "Wind_Direction",
+            "Junction_Bin",  # Sadece Junction_Bin kullanılıyor
             "Civil_Twilight", "Sunrise_Sunset", "State", "City_Cleaned", "Street_Cleaned",
-            "Wind_Chill(F)", "Junction", "Crossing", "Traffic_Signal"
+            "DayOfWeek", "Start_Lat", "Start_Lng", "Hour", "Month", "TimeSlot", 
+            "Weather_Day", "Weather_Hour"
         ]
 
         return df.select(*selected_cols)
@@ -59,76 +88,81 @@ class AccidentSeverityPredictor:
 
     def _get_time_based_conditions(self, hour):
         """Saate göre hava ve trafik koşullarını belirle"""
-        if 5 <= hour < 7:  # Sabah erken - Sis riski yüksek
+        if 5 <= hour < 7:  # Sabah erken - Daha normal koşullar
             return {
                 "weather_weights": {
-                    "Clear": 0.2, 
-                    "Fog": 0.4, 
-                    "Heavy Rain": 0.2,
-                    "Snow": 0.2
+                    "Clear": 0.4,
+                    "Fog": 0.3,
+                    "Heavy Rain": 0.1,
+                    "Snow": 0.1,
+                    "Rain": 0.1
                 },
-                "traffic_factor": 0.9,  # Tehlikeli koşullar
+                "traffic_factor": 1.0,  # Normal seviye
                 "twilight": "Dawn",
-                "risk_factor": 1.5  # Ekstra risk faktörü
+                "risk_factor": 1.2  # Azaltıldı
             }
         elif 7 <= hour < 10:  # Sabah rush - Yoğun trafik
             return {
                 "weather_weights": {
-                    "Clear": 0.3,
-                    "Rain": 0.3,
-                    "Heavy Rain": 0.2,
+                    "Clear": 0.5,  # Daha fazla normal hava
+                    "Rain": 0.2,
+                    "Heavy Rain": 0.1,
                     "Fog": 0.2
                 },
-                "traffic_factor": 1.8,  # Çok yüksek trafik
+                "traffic_factor": 1.3,  # Azaltıldı
                 "twilight": "Day",
-                "risk_factor": 1.7
+                "risk_factor": 1.2  # Azaltıldı
             }
-        elif 10 <= hour < 16:  # Gün ortası - Değişken hava
+        elif 10 <= hour < 16:  # Gün ortası - Daha normal koşullar
             return {
                 "weather_weights": {
-                    "Clear": 0.2,
-                    "Heavy Rain": 0.3,
-                    "Snow": 0.2,
-                    "Fog": 0.3
+                    "Clear": 0.6,  # Çoğunlukla güzel hava
+                    "Heavy Rain": 0.1,
+                    "Snow": 0.1,
+                    "Fog": 0.1,
+                    "Rain": 0.1
                 },
-                "traffic_factor": 1.2,
+                "traffic_factor": 1.0,  # Normal trafik
                 "twilight": "Day",
-                "risk_factor": 1.3
+                "risk_factor": 1.0  # Normal risk
             }
-        elif 16 <= hour < 19:  # Akşam rush - En riskli zaman
+        elif 16 <= hour < 19:  # Akşam rush - Biraz daha riskli
             return {
                 "weather_weights": {
-                    "Heavy Rain": 0.4,
-                    "Snow": 0.3,
+                    "Clear": 0.4,
+                    "Heavy Rain": 0.2,
+                    "Snow": 0.1,
                     "Fog": 0.2,
-                    "Clear": 0.1
+                    "Rain": 0.1
                 },
-                "traffic_factor": 2.0,  # En yüksek trafik
+                "traffic_factor": 1.5,  # Azaltıldı
                 "twilight": "Day",
-                "risk_factor": 2.0
+                "risk_factor": 1.3  # Azaltıldı
             }
-        elif 19 <= hour < 22:  # Akşam - Kötü görüş
+        elif 19 <= hour < 22:  # Akşam - Orta seviye
             return {
                 "weather_weights": {
-                    "Fog": 0.4,
-                    "Heavy Rain": 0.3,
-                    "Snow": 0.2,
-                    "Clear": 0.1
+                    "Clear": 0.4,
+                    "Fog": 0.2,
+                    "Heavy Rain": 0.2,
+                    "Snow": 0.1,
+                    "Rain": 0.1
                 },
-                "traffic_factor": 1.5,
+                "traffic_factor": 1.1,
                 "twilight": "Dusk",
-                "risk_factor": 1.8
+                "risk_factor": 1.1
             }
-        else:  # Gece - En kötü görüş
+        else:  # Gece - Daha normal gece koşulları
             return {
                 "weather_weights": {
-                    "Fog": 0.5,
-                    "Snow": 0.3,
-                    "Heavy Rain": 0.2
+                    "Clear": 0.5,
+                    "Fog": 0.2,
+                    "Snow": 0.15,
+                    "Heavy Rain": 0.15
                 },
-                "traffic_factor": 1.0,
+                "traffic_factor": 0.8,  # Gece az trafik
                 "twilight": "Night",
-                "risk_factor": 1.6
+                "risk_factor": 1.1
             }
 
     def _generate_random_accident(self):
@@ -222,31 +256,58 @@ class AccidentSeverityPredictor:
             temp_max -= 15
         temp = round(random.uniform(temp_min, temp_max), 1)
 
-        # Hava durumuna göre görüş mesafesini ayarla
-        if weather_condition in ["Fog", "Heavy Rain", "Snow"]:
-            visibility = round(random.uniform(0.1, 3.0), 1)
-        elif weather_condition in ["Light Rain", "Light Snow", "Mist"]:
-            visibility = round(random.uniform(2.0, 6.0), 1)
-        else:
-            visibility = round(random.uniform(5.0, 10.0), 1)
+        # Risk faktörünü al
+        risk_factor = conditions.get("risk_factor", 1.0)
 
-        # Rüzgar yönü ve hızı
+        # Ekstrem koşulları azalt - daha normale yakın veriler üret
+        extreme_conditions = random.random() < 0.15  # %15 olasılıkla ekstrem koşullar (önceden %40)
+
+        # Hava durumuna ve risk faktörüne göre görüş mesafesini ayarla - daha normal değerler
+        if extreme_conditions:
+            visibility = round(random.uniform(0.5, 2.0), 1)  # Daha normal ekstrem değerler
+        elif weather_condition in ["Fog", "Heavy Rain", "Snow"]:
+            visibility = round(random.uniform(1.0, 3.0), 1)  # Daha iyi görüş
+        elif weather_condition in ["Light Rain", "Light Snow", "Mist"]:
+            visibility = round(random.uniform(3.0, 6.0), 1)
+        else:
+            visibility = round(random.uniform(5.0, 10.0), 1)  # Normal hava - iyi görüş
+
+        # Rüzgar yönü ve hızı - daha normal değerler
         wind_directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         wind_direction = random.choice(wind_directions)
-        if "Rain" in weather_condition or "Storm" in weather_condition:
-            wind_speed = round(random.uniform(10.0, 30.0), 1)
+        if extreme_conditions:
+            wind_speed = round(random.uniform(25.0, 45.0), 1)  # Güçlü ama makul rüzgar
+        elif "Rain" in weather_condition or "Storm" in weather_condition:
+            wind_speed = round(random.uniform(15.0, 30.0), 1)  # Orta seviye rüzgar
         else:
-            wind_speed = round(random.uniform(0.0, 15.0), 1)
+            wind_speed = round(random.uniform(5.0, 20.0), 1)  # Normal rüzgar
+
+        # Yağış miktarını artır
+        precipitation = round(
+            random.uniform(0.0, 4.0) * (2 if extreme_conditions else 1) * 
+            (1.5 if "Rain" in weather_condition or "Storm" in weather_condition else 0.2),
+            2
+        )
+
+        # Risk faktörüne göre ekstra özellikler - daha az ekstrem
+        extra_risk = random.random() < (risk_factor * 0.1)  # Risk faktörüne bağlı olasılık (azaltıldı)
+        
+        # Sıcaklık ekstremlerini artır
+        if extra_risk:
+            if random.random() < 0.5:  # Aşırı sıcak
+                temp = round(random.uniform(95, 115), 1)
+            else:  # Aşırı soğuk
+                temp = round(random.uniform(-10, 20), 1)
 
         return {
             "Start_Time": start_time.strftime("%Y-%m-%d %H:%M:%S"),
             "End_Time": end_time.strftime("%Y-%m-%d %H:%M:%S"),
             "Temperature(F)": temp,
-            "Humidity(%)": round(random.uniform(30.0, 100.0), 1),
-            "Pressure(in)": round(random.uniform(29.0, 31.0), 2),
+            "Humidity(%)": round(random.uniform(70.0, 100.0) if "Rain" in weather_condition or "Fog" in weather_condition else random.uniform(30.0, 90.0), 1),
+            "Pressure(in)": round(random.uniform(28.5, 31.5), 2),  # Daha geniş basınç aralığı
             "Visibility(mi)": visibility,
             "Wind_Speed(mph)": wind_speed,
-            "Precipitation(in)": round(random.uniform(0.0, 2.0) * (1 if "Rain" in weather_condition else 0.1), 2),
+            "Precipitation(in)": precipitation,
             "Weather_Condition": weather_condition,
             "Wind_Direction": wind_direction,
             "Civil_Twilight": conditions["twilight"],
@@ -262,32 +323,84 @@ class AccidentSeverityPredictor:
             "Start_Lng": round(random.uniform(city_data["lng"][0], city_data["lng"][1]), 6)
         }
 
+
+
     def run_example(self, single_accident=False):
         # Tek kaza verisi üret
         example_rows = [self._generate_random_accident()]
         if not single_accident:
-            # Eski davranış: 3-7 arası rastgele kaza üret
             additional_accidents = random.randint(2, 6)
             example_rows.extend([self._generate_random_accident() for _ in range(additional_accidents)])
+        
         df = self.spark.createDataFrame(example_rows)
-        print("Preparing data...")
+        
+        # Veriyi hazırla (hem severity hem duration için aynı veriyi kullan)
         df_clean = self._prepare_data(df)
-        print("Making predictions...")
-        predictions = self.model.transform(df_clean)
-        print("Predictions made successfully.")
+        
+        # Debug: Veri kontrol
+        print("=== DEBUG INFO ===")
+        print("DataFrame shape:", df_clean.count(), "x", len(df_clean.columns))
+        print("Columns:", df_clean.columns)
+        df_clean.show(5, truncate=False)
+        
+        # Severity ve Duration tahminlerini yap
+        severity_predictions = self.severity_model.transform(df_clean)
+        duration_predictions = self.duration_model.transform(df_clean)
+
+        # Debug: Tahmin sonuçları
+        print("\n=== PREDICTIONS ===")
+        print("Severity predictions:")
+        severity_predictions.select("prediction", "probability").show(truncate=False)
+        print("Duration predictions:")
+        duration_predictions.select("prediction", "probability").show(truncate=False)
 
         # Tahminleri al
-        predictions_data = predictions.select("prediction").collect()
+        severity_data = severity_predictions.select("prediction").collect()
+        duration_data = duration_predictions.select("prediction").collect()
+        
+        # Duration tahminini sınıflara göre dakikaya çevir
+        def duration_class_to_minutes(prediction):
+            if prediction == 0:  # Very Short
+                return 5
+            elif prediction == 1:  # Short
+                return 15
+            elif prediction == 2:  # Medium
+                return 60
+            elif prediction == 3:  # Long
+                return 180
+            else:  # Very Long
+                return 360
+                
+        # Duration sınıf isimlerini al
+        def duration_class_to_name(prediction):
+            if prediction == 0:
+                return "Very Short"
+            elif prediction == 1:
+                return "Short"
+            elif prediction == 2:
+                return "Medium"
+            elif prediction == 3:
+                return "Long"
+            else:
+                return "Very Long"
+        
         # Orijinal verileri al
         original_data = df.select(
             "Start_Lat", "Start_Lng", "Temperature(F)", 
-            "Weather_Condition", "Start_Time"
+            "Weather_Condition", "Start_Time", "City", "Street"
         ).collect()
         
-        # İki veri setini birleştir
-        for pred, orig in zip(predictions_data, original_data):
+        # Tüm verileri birleştir
+        for sev, dur, orig in zip(severity_data, duration_data, original_data):
+            # Duration modelinin prediction'ını kullan (0-4 arası sınıf)
+            duration_class = int(dur["prediction"])
+            duration_minutes = duration_class_to_minutes(duration_class)
+            duration_name = duration_class_to_name(duration_class)
+            
             message = {
-                "prediction": float(pred["prediction"]),
+                "severity": float(sev["prediction"]),
+                "duration": duration_minutes,  # Dakika cinsinden süre
+                "duration_name": duration_name,  # Sınıf ismi (Short, Medium, etc.)
                 "location": {
                     "lat": float(orig["Start_Lat"]),
                     "lng": float(orig["Start_Lng"])
@@ -296,7 +409,12 @@ class AccidentSeverityPredictor:
                 "details": {
                     "temperature": float(orig["Temperature(F)"]),
                     "weather": str(orig["Weather_Condition"]),
-                    "time": str(orig["Start_Time"])
+                    "time": str(orig["Start_Time"]),
+                    "estimated_duration": duration_name,  # Sınıf ismini göster
+                    "duration_minutes": f"{int(duration_minutes)} minutes",  # Dakika bilgisi ayrı
+                    "duration_class": duration_class,  # Debug için ekle
+                    "city": str(orig["City"]) if "City" in orig else "Unknown",
+                    "street": str(orig["Street"]) if "Street" in orig else "Unknown"
                 }
             }
             self.producer.send(self.kafka_topic, message)
